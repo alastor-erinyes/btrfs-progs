@@ -97,16 +97,26 @@ struct btrfs_mkfs_config {
 	u64 super_bytenr;
 };
 
+struct subvolume_from_opt {
+        char *path;
+        u32 mode;
+        char *source_dir;
+};
+
 int make_btrfs(int fd, struct btrfs_mkfs_config *cfg);
 int btrfs_make_root_dir(struct btrfs_trans_handle *trans,
 			struct btrfs_root *root, u64 objectid);
 u64 btrfs_min_dev_size(u32 nodesize, int mixed, u64 meta_profile,
 		       u64 data_profile);
 int test_minimum_size(const char *file, u64 min_dev_size);
+int parse_subvolumes(const char *subvolumes_opt, struct subvolume_from_opt subvolumes[]);
+int inherit_rootdir_mode(const u8 subvolume_cnt, struct subvolume_from_opt subvolumes[], char *rootdir);
 int is_vol_small(const char *file);
 int test_num_disk_vs_raid(u64 metadata_profile, u64 data_profile,
 	u64 dev_cnt, int mixed, int ssd);
 int test_status_for_mkfs(const char *file, bool force_overwrite);
 int test_dev_for_mkfs(const char *file, int force_overwrite);
+int fopen_mode_to_flags(const char *mode);
+const char* startswith(const char *word, const char *prefix);
 
 #endif

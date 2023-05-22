@@ -14,6 +14,7 @@
  * Boston, MA 021110-1307, USA.
  */
 
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -1185,3 +1186,134 @@ int test_minimum_size(const char *file, u64 min_dev_size)
 }
 
 
+// Parses the following format
+//
+// --subvolumes /some/path,mode,source_dir;/other/path,mode,other_source_dir
+//
+// Eg: --subvolumes my/path,r,/usr/sbin;other/path,w,/usr/local/bin
+//
+// Modes are those supported by `fopen()`
+int parse_subvolumes(const char* subvolumes_opt, struct subvolume_from_opt subvolumes[]) {
+        u8 count = 0;
+        u8 sub_count = 0;
+        char* temp = strdup(subvolumes_opt);
+        char* token = strtok(temp, ";");
+        char* path = NULL;
+        char* source_dir = NULL;
+        char* mode_str = NULL;
+        u32 mode = 0;
+        int ret;
+
+        while (token != NULL) {
+                char* temp2 = strdup(token);
+                char* sub_token = strtok(temp2, ",");
+                sub_count = 0;
+                while (sub_token != NULL) {
+                        if (sub_count == 0) {
+                                path = strdup(sub_token);
+                        } else if (sub_count == 1) {
+                                mode_str = strdup(sub_token);
+                                ret = fopen_mode_to_flags(mode_str);
+                                if (ret < 0) {
+                                        error("Invalid mode str: %s", mode_str);
+                                        return ret;
+                                }
+                                mode = (u32)ret;
+                        } else if (sub_count == 2) {
+                                source_dir = strdup(sub_token);
+                        } else {
+                                error("Invalid argument: %s", sub_token);
+                                return -1;
+                        }
+                        sub_count++;
+                        sub_token = strtok(NULL, ",");
+                }
+                subvolumes[count] = (struct subvolume_from_opt) {
+                        .path = path,
+                        .mode = mode,
+                        .source_dir = source_dir,
+                };
+                count++;
+                token = strtok(NULL, ";");
+                free(temp2);
+        }
+
+        free(temp);
+        return count;
+}
+
+// The mode will be inherited if mode is unset (assumed mode of zero is unset)
+int inherit_rootdir_mode(const u8 subvolume_cnt, struct subvolume_from_opt subvolumes[], char *rootdir) {
+        int i;
+	struct stat	st_buf;
+
+        if (rootdir == NULL)
+                return 0;
+
+	if (stat(rootdir, &st_buf) < 0)
+		return -errno;
+
+        for (i = 0; i < subvolume_cnt; i++) {
+                // Only inherit the mode if it's currently unset
+                if (subvolumes[i].mode == 0) {
+                        subvolumes[i].mode = st_buf.st_mode;
+                }
+        }
+        return 0;
+}
+
+
+int fopen_mode_to_flags(const char *mode) {
+        const char *p;
+        int flags;
+        assert(mode);
+        if ((p = startswith(mode, "r+")))
+                flags = O_RDWR;
+        else if ((p = startswith(mode, "r")))
+                flags = O_RDONLY;
+        else if ((p = startswith(mode, "w+")))
+                flags = O_RDWR|O_CREAT|O_TRUNC;
+        else if ((p = startswith(mode, "w")))
+                flags = O_WRONLY|O_CREAT|O_TRUNC;
+        else if ((p = startswith(mode, "a+")))
+                flags = O_RDWR|O_CREAT|O_APPEND;
+        else if ((p = startswith(mode, "a")))
+                flags = O_WRONLY|O_CREAT|O_APPEND;
+        else
+                return -EINVAL;
+        for (; *p != 0; p++) {
+                switch (*p) {
+                case 'e':
+                        flags |= O_CLOEXEC;
+                        break;
+                case 'x':
+                        flags |= O_EXCL;
+                        break;
+                case 'm':
+                        /* ignore this here, fdopen() might care later though */
+                        break;
+                case 'c': /* not sure what to do about this one */
+                default:
+                        return -EINVAL;
+                }
+        }
+        return (u32)flags;
+}
+
+const char* startswith(const char *word, const char *prefix) {
+    size_t prefixLength = strlen(prefix);
+    size_t wordLength = strlen(word);
+
+    if (wordLength < prefixLength) {
+        return NULL;
+    }
+
+    if (strncmp(word, prefix, prefixLength) == 0) {
+        char *consumedPrefix = malloc((prefixLength + 1) * sizeof(char));
+        strncpy(consumedPrefix, word, prefixLength);
+        consumedPrefix[prefixLength] = '\0';
+        return consumedPrefix;
+    }
+
+    return NULL;
+}

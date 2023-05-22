@@ -59,6 +59,16 @@
 #include "mkfs/common.h"
 #include "mkfs/rootdir.h"
 
+// Coordinating incrementing our object ids
+u64 _btrfs_starting_object_id_no_touchy = BTRFS_FIRST_FREE_OBJECTID;
+
+// Stub to behave somewhat similarly to the kernel function but since we're
+// always starting from zero subvolumes we just increment _starting_object_id
+u64 btrfs_get_free_objectid() {
+        _btrfs_starting_object_id_no_touchy++;
+        return _btrfs_starting_object_id_no_touchy;
+}
+
 struct mkfs_allocation {
 	u64 data;
 	u64 metadata;
@@ -211,7 +221,7 @@ static int make_root_dir(struct btrfs_trans_handle *trans,
 			      BTRFS_ROOT_TREE_DIR_OBJECTID);
 	if (ret)
 		goto err;
-	ret = btrfs_make_root_dir(trans, root, BTRFS_FIRST_FREE_OBJECTID);
+	ret = btrfs_make_root_dir(trans, root, btrfs_get_free_objectid());
 	if (ret)
 		goto err;
 	memcpy(&location, &root->fs_info->fs_root->root_key, sizeof(location));
@@ -433,6 +443,7 @@ static const char * const mkfs_usage[] = {
 	OPTLINE("--shrink", "(with --rootdir) shrink the filled filesystem to minimal size"),
 	OPTLINE("-K|--nodiscard", "do not perform whole device TRIM"),
 	OPTLINE("-f|--force", "force overwrite of existing filesystem"),
+        OPTLINE("-F|--subvolumes", "Create subvolumes, comma separated names/paths"),
 	"General:",
 	OPTLINE("-q|--quiet", "no messages except errors"),
 	OPTLINE("-v|--verbose", "increase verbosity level, default is 1"),
@@ -712,7 +723,7 @@ static int create_data_reloc_tree(struct btrfs_trans_handle *trans)
 		.objectid = BTRFS_DATA_RELOC_TREE_OBJECTID,
 		.type = BTRFS_ROOT_ITEM_KEY,
 	};
-	u64 ino = BTRFS_FIRST_FREE_OBJECTID;
+	u64 ino = btrfs_get_free_objectid();
 	char *name = "..";
 	int ret;
 
@@ -984,6 +995,52 @@ static void *prepare_one_device(void *ctx)
 	return NULL;
 }
 
+// Creates a subvolume and copies a root directory to it if provided
+int create_subvol(struct btrfs_trans_handle *trans,
+                  struct btrfs_fs_info *fs_info,
+                  struct subvolume_from_opt *subvolume,
+                  u64 ino,
+                  bool shrink_rootdir,
+                  u64 shrink_size,
+                  bool verbose)
+{
+	int ret;
+        // Create subvolume root in main root's tree.  We increment based on
+        // BTRFS_FIRST_FREE_OBJECTID to ensure that we get the first subvolumes_cnt
+        // entries in fs_info->tree_root.
+        ret = btrfs_create_root(trans, fs_info, btrfs_get_free_objectid());
+        if (ret < 0) {
+                error("failed to create subvolume root %s: %d (%m)", subvolume->path, ret);
+                return ret;
+        }
+
+        // Create inode
+        ret = btrfs_new_inode(trans, fs_info->tree_root, ino, subvolume->mode);
+        if (ret < 0) {
+		error("Could not create subvol %s", subvolume->path);
+		return ret;
+        }
+
+        if (subvolume->source_dir != NULL) {
+                // Fill with data from rootdir
+		ret = btrfs_mkfs_fill_dir(subvolume->source_dir, fs_info->tree_root, verbose);
+		if (ret) {
+			error("error while filling filesystem: %d", ret);
+                        return ret;
+		}
+		if (shrink_rootdir) {
+			ret = btrfs_mkfs_shrink_fs(fs_info, &shrink_size,
+						   shrink_rootdir);
+			if (ret < 0) {
+				error("error while shrinking filesystem: %d",
+					ret);
+                                return ret;
+			}
+		}
+        }
+        return 0;
+}
+
 int BOX_MAIN(mkfs)(int argc, char **argv)
 {
 	char *file;
@@ -1026,6 +1083,8 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 	int nr_global_roots = sysconf(_SC_NPROCESSORS_ONLN);
 	char *source_dir = NULL;
 	bool source_dir_set = false;
+        u8 subvolumes_cnt = 0;
+        struct subvolume_from_opt subvolumes[256];
 
 	cpu_detect_flags();
 	hash_init_accel();
@@ -1046,6 +1105,7 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 			{ "checksum", required_argument, NULL,
 				GETOPT_VAL_CHECKSUM },
 			{ "force", no_argument, NULL, 'f' },
+			{ "subvolumes", required_argument, NULL, 'F' },
 			{ "leafsize", required_argument, NULL, 'l' },
 			{ "label", required_argument, NULL, 'L'},
 			{ "metadata", required_argument, NULL, 'm' },
@@ -1184,6 +1244,15 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 			case 'q':
 				bconf_be_quiet();
 				break;
+                        case 'F':
+                                memset(subvolumes, 0, sizeof(subvolumes));
+                                ret = parse_subvolumes(optarg, subvolumes);
+                                if (ret < 0) {
+                                        error("Could not parse subvolumes argument %s", optarg);
+                                        goto error;
+                                }
+                                subvolumes_cnt = (u8)ret;
+                                break;
 			case GETOPT_VAL_SHRINK:
 				shrink_rootdir = true;
 				break;
@@ -1199,6 +1268,9 @@ int BOX_MAIN(mkfs)(int argc, char **argv)
 				usage(&mkfs_cmd, c != GETOPT_VAL_HELP);
 		}
 	}
+
+        if (bconf.verbose && subvolumes_cnt > 0)
+                printf("Creating with %d subvolumes\n", subvolumes_cnt);
 
 	if (bconf.verbose) {
 		printf("%s\n", PACKAGE_STRING);
@@ -1721,6 +1793,46 @@ raid_groups:
 		error("failed to cleanup temporary chunks: %d", ret);
 		goto out;
 	}
+
+
+        // If a source directory is set all subvolumes will be checked to see
+        // if they should inherit the mode of the source directory or if they
+        // have their own modes provided via the --subvolumes flag
+        if (source_dir_set && subvolumes_cnt > 0) {
+                ret = inherit_rootdir_mode(subvolumes_cnt, subvolumes, source_dir);
+                if (ret < 0) {
+                        error("Could not inherit rootdir mode from dir: %s", source_dir);
+                        goto out;
+                }
+        }
+        /// If we are creating subvolumes we'll do it here so the new metadata
+        /// can be properly RAID'ed and the fs is setup properly
+        for (i = 0; i < subvolumes_cnt; i++) {
+                printf("Creating subvolume: %s\n", subvolumes[i].path);
+
+                // Start transaction on main root
+                trans = btrfs_start_transaction(fs_info->tree_root, 1);
+                if (IS_ERR(trans)) {
+                        errno = -PTR_ERR(trans);
+                        error_msg(ERROR_MSG_START_TRANS, "%m");
+                        goto out;
+                }
+
+                ret = create_subvol(trans, fs_info, &subvolumes[i], 0,
+                                    shrink_rootdir, shrink_size, bconf.verbose);
+                if (ret < 0) {
+                        error("failed to create subvolume %s", subvolumes[i].path);
+                        goto out;
+                }
+
+                ret = btrfs_commit_transaction(trans, fs_info->tree_root);
+                if (ret < 0) {
+                        errno = -ret;
+                        error_msg(ERROR_MSG_COMMIT_TRANS, "%m");
+                        goto out;
+                }
+        }
+
 
 	if (source_dir_set) {
 		ret = btrfs_mkfs_fill_dir(source_dir, root, bconf.verbose);
